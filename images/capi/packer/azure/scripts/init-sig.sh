@@ -13,7 +13,8 @@ az account set -s ${AZURE_SUBSCRIPTION_ID} >/dev/null 2>&1
 eval "$tracestate"
 
 export RESOURCE_GROUP_NAME="${RESOURCE_GROUP_NAME:-cluster-api-images}"
-export AZURE_LOCATION="${AZURE_LOCATION:-northcentralus}"
+export AZURE_LOCATION="${AZURE_LOCATION:-southcentralus}"
+
 if ! az group show -n ${RESOURCE_GROUP_NAME} -o none 2>/dev/null; then
   az group create -n ${RESOURCE_GROUP_NAME} -l ${AZURE_LOCATION} --tags ${TAGS:-}
 fi
@@ -40,6 +41,43 @@ az sig create --resource-group ${RESOURCE_GROUP_NAME} --gallery-name ${GALLERY_N
 
 SECURITY_TYPE_CVM_SUPPORTED_FEATURE="SecurityType=ConfidentialVmSupported"
 
+SIG_TARGET=$1
+
+
+##############################################################################
+##### TODO: [AUGUST 2024] Remove purchase plan info when the image is GA #####
+# TODO: [AUGUST 2024] Remove purchase plan info when the image is GA
+# Creating Azure VMs from a Marketplace Image requires a Purchase Plan
+# https://learn.microsoft.com/en-us/azure/virtual-machines/marketplace-images
+# HACK: Extract purchase plan info from the target json. We want to avoid changing the Prow jobs YAML files to add these
+# values as environment variables.
+TARGET_JSON="$(realpath packer/azure/$SIG_TARGET.json)"
+export PLAN_PUBLISHER=$(jq -r '.plan_image_publisher' "$TARGET_JSON")
+export PLAN_OFFER=$(jq -r '.plan_image_offer' "$TARGET_JSON")
+export PLAN_NAME=$(jq -r '.plan_image_sku' "$TARGET_JSON")
+export PLAN_VERSION=${PLAN_VERSION:-"latest"}
+
+# WHY? Build fails with: "You have not accepted the legal terms on this subscription"
+if [[ "${PLAN_PUBLISHER}" != "null" ]] && [[ "${PLAN_OFFER}" != "null"  ]] && [[ "${PLAN_NAME}" != "null"  ]]; then
+  PLAN_URN="${PLAN_PUBLISHER}:${PLAN_OFFER}:${PLAN_NAME}:$(echo $PLAN_VERSION)"
+  echo "Plan info: ${PLAN_URN}"
+  # publisher:offer:sku:version
+  # Retrieve the terms for the specified Linux VM image
+  image_terms=$(az vm image terms show --urn "${PLAN_URN}")
+
+  # Check if the terms are accepted
+  accepted=$(echo "$image_terms" | jq -r '.accepted')
+
+  # If terms are not accepted, then accept them
+  if [[ "$accepted" != "true" ]]; then
+    echo "Accepting terms for image URN: ${PLAN_URN}"
+    az vm image terms accept --urn "${PLAN_URN}"
+  fi
+fi
+
+############# END: SECTION TO BE REMOVED AFTER IMAGE IS GA ###################
+##############################################################################
+
 create_image_definition() {
   az sig image-definition create \
     --resource-group ${RESOURCE_GROUP_NAME} \
@@ -50,10 +88,11 @@ create_image_definition() {
     --sku ${SIG_SKU:-$2} \
     --hyper-v-generation ${3} \
     --os-type ${4} \
-    --features ${5:-''}
+    --features ${5:-''} \
+    --plan-name ${PLAN_NAME} \
+    --plan-product ${PLAN_OFFER} \
+    --plan-publisher ${PLAN_PUBLISHER}
 }
-
-SIG_TARGET=$1
 
 case ${SIG_TARGET} in
   ubuntu-2004)
@@ -82,6 +121,9 @@ case ${SIG_TARGET} in
   ;;
   windows-2022-containerd)
     create_image_definition ${SIG_TARGET} "win-2022-containerd" "V1" "Windows"
+  ;;
+  windows-2025-containerd)
+    create_image_definition ${SIG_TARGET} "win-2025-containerd" "V2" "Windows"
   ;;
   windows-annual-containerd)
     create_image_definition ${SIG_TARGET} "win-annual-containerd" "V1" "Windows"
